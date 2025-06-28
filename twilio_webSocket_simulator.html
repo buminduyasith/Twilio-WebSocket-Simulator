@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Twilio WebSocket Simulator</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+        background: #f5f5f5;
+      }
+      .container {
+        background: white;
+        padding: 20px;
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      }
+      .controls {
+        margin-bottom: 20px;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      button {
+        padding: 8px 16px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 14px;
+      }
+      .connect {
+        background: #28a745;
+        color: white;
+      }
+      .disconnect {
+        background: #dc3545;
+        color: white;
+      }
+      .mute-self {
+        background: #fd7e14; /* Orange for muted mic */
+        color: white;
+      }
+      .unmute-self {
+        background: #20c997; /* Teal for unmuted mic */
+        color: white;
+      }
+      input,
+      select {
+        padding: 8px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        margin-right: 10px;
+      }
+      .log {
+        background: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 4px;
+        padding: 15px;
+        height: 300px;
+        overflow-y: auto;
+        font-family: monospace;
+        font-size: 12px;
+        white-space: pre-wrap;
+      }
+      .status {
+        padding: 10px;
+        border-radius: 4px;
+        margin-bottom: 15px;
+        font-weight: bold;
+      }
+      .connecting {
+        background: #fff3cd; /* Light yellow */
+        color: #856404;
+      }
+      .connected {
+        background: #d4edda;
+        color: #155724;
+      }
+      .disconnected {
+        background: #f8d7da;
+        color: #721c24;
+      }
+      .calling {
+        background: #d1ecf1;
+        color: #0c5460;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Twilio WebSocket Simulator</h1>
+
+      <div id="status" class="status disconnected">Disconnected</div>
+
+      <div class="controls">
+        <input
+          type="text"
+          id="wsUrl"
+          placeholder="WebSocket URL"
+          value="ws://localhost:8000/ws/v1/twilio/voice"
+        />
+        <input
+          type="text"
+          id="workflowId"
+          placeholder="Workflow ID"
+          value="5cfcf0e6-4c57-475c-a25e-f5189d207de2"
+        />
+        <input
+          type="text"
+          id="fromNumber"
+          placeholder="From Number"
+          value="+1234567890"
+        />
+        <input
+          type="text"
+          id="toNumber"
+          placeholder="To Number"
+          value="+0987654321"
+        />
+        <button class="connect" onclick="connect()">
+          Connect & Start Call
+        </button>
+        <button class="disconnect" onclick="disconnect()">
+          End Call & Disconnect
+        </button>
+        <button id="muteSelfBtn" class="unmute-self" onclick="toggleMuteSelf()">
+          Mute My Self
+        </button>
+        <button onclick="testAudio()">Test Audio Playback</button>
+      </div>
+
+      <div class="log" id="log"></div>
+    </div>
+
+    <script>
+      let ws = null;
+      let isRecording = false; // Indicates if microphone stream is active for sending
+      let audioStream = null; // Holds the MediaStream from getUserMedia
+      let audioTrack = null; // New: Reference to the microphone audio track
+      let audioProcessor = null; // ScriptProcessorNode for sending audio
+      let streamSid = null;
+      let callActive = false;
+      // let isMutedSelf = false; // This variable is no longer directly used for mic data sending
+
+      function log(message) {
+        const logElement = document.getElementById("log");
+        const timestamp = new Date().toLocaleTimeString();
+        logElement.textContent += `[${timestamp}] ${message}\n`;
+        logElement.scrollTop = logElement.scrollHeight;
+      }
+
+      function updateStatus(status, className) {
+        const statusElement = document.getElementById("status");
+        statusElement.textContent = status;
+        statusElement.className = `status ${className}`;
+      }
+
+      async function connect() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          log("Already connected.");
+          return;
+        }
+
+        const url = document.getElementById("wsUrl").value;
+        updateStatus("Connecting...", "connecting");
+        log("Attempting to connect to WebSocket...");
+
+        try {
+          ws = new WebSocket(url);
+
+          ws.onopen = function () {
+            log("Connected to WebSocket");
+            initAudioContext(); // Initialize audio context on connect
+            startCallAndRecording(); // Start the call and microphone capture
+          };
+
+          ws.onmessage = function (event) {
+            handleServerMessage(JSON.parse(event.data));
+          };
+
+          ws.onclose = function () {
+            log("WebSocket closed");
+            updateStatus("Disconnected", "disconnected");
+            callActive = false;
+            stopAudioPlayback(); // Stop any pending audio playback
+            stopRecording(); // Stop microphone recording
+          };
+
+          ws.onerror = function (error) {
+            log("WebSocket error: " + error.message);
+            updateStatus("Disconnected", "disconnected");
+            callActive = false;
+            stopAudioPlayback();
+            stopRecording();
+          };
+        } catch (error) {
+          log("Connection error: " + error.message);
+          updateStatus("Disconnected", "disconnected");
+        }
+      }
+
+      function disconnect() {
+        if (ws) {
+          const stopEvent = {
+            event: "stop",
+            streamSid: streamSid,
+          };
+          if (callActive) {
+            log("Sending stop event to server...");
+            ws.send(JSON.stringify(stopEvent)); // Inform server about call end
+          }
+          ws.close();
+          ws = null;
+        }
+        stopRecording(); // Stop microphone capture
+        stopAudioPlayback(); // Stop playback of server audio
+        callActive = false;
+        updateStatus("Disconnected", "disconnected");
+        log("Call ended and WebSocket disconnected.");
+      }
+
+      async function startCallAndRecording() {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          log("WebSocket not connected, cannot start call and recording.");
+          return;
+        }
+        if (callActive) {
+          log("Call already active.");
+          return;
+        }
+
+        streamSid = "stream_" + Math.random().toString(36).substr(2, 9);
+        const workflowId = document.getElementById("workflowId").value;
+        const fromNumber = document.getElementById("fromNumber").value;
+        const toNumber = document.getElementById("toNumber").value;
+
+        const startEvent = {
+          event: "start",
+          start: {
+            streamSid: streamSid,
+            customParameters: {
+              workflow_id: workflowId,
+              to: toNumber,
+              from: fromNumber,
+            },
+            // Twilio defaults to PCMU, which is G.711 mu-law, so no explicit audio codec needed
+          },
+        };
+
+        ws.send(JSON.stringify(startEvent));
+        log("Sent start event to begin call: " + JSON.stringify(startEvent));
+        callActive = true;
+        updateStatus("Call Active", "calling");
+
+        // Now, also start recording the microphone
+        startRecording();
+      }
+
+      async function startRecording() {
+        if (isRecording) {
+          log("Microphone already recording.");
+          return;
+        }
+
+        try {
+          audioStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              sampleRate: 8000,
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
+
+          // Get the first audio track
+          audioTrack = audioStream.getAudioTracks()[0]; // NEW: Store the audio track
+
+          audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+          const source = audioContext.createMediaStreamSource(audioStream);
+
+          source.connect(audioProcessor);
+          audioProcessor.connect(audioContext.destination);
+
+          audioProcessor.onaudioprocess = function (event) {
+            // Only proceed if the call is active and the audio track is enabled
+            if (!callActive || !audioTrack.enabled) {
+              // Logic based on track enabled state
+              return;
+            }
+
+            const inputBuffer = event.inputBuffer;
+            const inputData = inputBuffer.getChannelData(0);
+
+            // Convert float32 to 16-bit linear PCM, then to G.711 μ-law
+            const ulawData = new Uint8Array(inputData.length);
+            for (let i = 0; i < inputData.length; i++) {
+              const linearSample = Math.max(
+                -32768,
+                Math.min(32767, inputData[i] * 32768)
+              );
+              ulawData[i] = linearToUlaw(linearSample);
+            }
+
+            // Convert to base64
+            let binary = "";
+            for (let i = 0; i < ulawData.length; i++) {
+              binary += String.fromCharCode(ulawData[i]);
+            }
+            const base64 = btoa(binary);
+
+            sendMediaEvent(base64);
+          };
+
+          isRecording = true;
+          log("Started microphone recording and processing audio.");
+        } catch (error) {
+          log("Error starting microphone recording: " + error.message);
+          isRecording = false;
+        }
+      }
+
+      function stopRecording() {
+        if (audioProcessor) {
+          audioProcessor.disconnect();
+          audioProcessor.onaudioprocess = null;
+          audioProcessor = null;
+        }
+        if (audioStream) {
+          audioStream.getTracks().forEach((track) => track.stop());
+          audioStream = null;
+          audioTrack = null; // Clear track reference
+          log("Stopped microphone recording.");
+        }
+        isRecording = false;
+      }
+
+      function sendMediaEvent(audioData) {
+        if (!ws || !callActive) return; // No check for isMutedSelf here
+
+        const mediaEvent = {
+          event: "media",
+          media: {
+            payload: audioData,
+            timestamp: Date.now().toString(),
+          },
+          streamSid: streamSid,
+        };
+
+        ws.send(JSON.stringify(mediaEvent));
+        if (Math.random() < 0.01) {
+          log("Sent G.711 μ-law media event.");
+        }
+      }
+
+      let audioContext = null;
+      let audioQueue = [];
+      let isPlaying = false;
+      let nextPlaybackTime = 0;
+
+      async function initAudioContext() {
+        if (!audioContext) {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)(
+            { sampleRate: 8000 }
+          );
+          if (audioContext.state === "suspended") {
+            await audioContext.resume();
+            log("AudioContext resumed.");
+          }
+          log(
+            "AudioContext initialized with sample rate: " +
+              audioContext.sampleRate +
+              " Hz"
+          );
+        }
+      }
+
+      function stopAudioPlayback() {
+        audioQueue = [];
+        isPlaying = false;
+        nextPlaybackTime = 0;
+        log("Stopped incoming audio playback and cleared queue.");
+      }
+
+      // G.711 μ-law encoding/decoding functions (unchanged)
+      function ulawToLinear(ulawByte) {
+        ulawByte = ~ulawByte;
+        const sign = ulawByte & 0x80;
+        const exponent = (ulawByte >> 4) & 0x07;
+        const mantissa = ulawByte & 0x0f;
+        let sample = mantissa << (exponent + 3);
+        if (exponent !== 0) sample += 0x84 << exponent;
+        if (sign !== 0) sample = -sample;
+        return sample;
+      }
+
+      function linearToUlaw(sample) {
+        const CLIP = 32635;
+        const sign = (sample >> 8) & 0x80;
+        if (sign !== 0) sample = -sample;
+        if (sample > CLIP) sample = CLIP;
+        sample += 0x84;
+        let exponent = 7;
+        for (
+          let expMask = 0x4000;
+          (sample & expMask) === 0 && exponent > 0;
+          exponent--, expMask >>= 1
+        ) {}
+        const mantissa = (sample >> (exponent + 3)) & 0x0f;
+        const ulawByte = ~(sign | (exponent << 4) | mantissa);
+        return ulawByte;
+      }
+
+      async function playAudioData(base64Audio) {
+        if (!audioContext || audioContext.state === "suspended") {
+          await initAudioContext();
+        }
+
+        const binaryString = atob(base64Audio);
+        const ulawBytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          ulawBytes[i] = binaryString.charCodeAt(i);
+        }
+
+        const audioBuffer = audioContext.createBuffer(
+          1,
+          ulawBytes.length,
+          8000
+        );
+        const channelData = audioBuffer.getChannelData(0);
+
+        for (let i = 0; i < ulawBytes.length; i++) {
+          const linearSample = ulawToLinear(ulawBytes[i]);
+          channelData[i] = linearSample / 32768.0;
+        }
+
+        audioQueue.push(audioBuffer);
+        if (!isPlaying) {
+          processAudioQueue();
+        }
+      }
+
+      async function processAudioQueue() {
+        if (audioQueue.length === 0) {
+          isPlaying = false;
+          return;
+        }
+
+        isPlaying = true;
+        const bufferToPlay = audioQueue.shift();
+
+        const source = audioContext.createBufferSource();
+        source.buffer = bufferToPlay;
+        source.connect(audioContext.destination);
+
+        const currentTime = audioContext.currentTime;
+        if (nextPlaybackTime < currentTime) {
+          nextPlaybackTime = currentTime;
+        }
+
+        source.start(nextPlaybackTime);
+        nextPlaybackTime += bufferToPlay.duration;
+
+        source.onended = () => {
+          processAudioQueue();
+        };
+      }
+
+      function handleServerMessage(data) {
+        if (data.event === "media") {
+          if (data.media && data.media.payload) {
+            playAudioData(data.media.payload);
+          }
+        } else if (data.event === "mark") {
+          const markResponse = {
+            event: "mark",
+            mark: data.mark,
+            streamSid: streamSid,
+          };
+          ws.send(JSON.stringify(markResponse));
+        } else if (data.event === "clear") {
+          log("Received clear event - clearing incoming audio queue.");
+          stopAudioPlayback();
+        }
+      }
+
+      function toggleMuteSelf() {
+        const muteSelfBtn = document.getElementById("muteSelfBtn");
+
+        if (!audioTrack) {
+          log("Microphone track not available to toggle mute.");
+          return;
+        }
+
+        // Toggle the enabled state of the audio track
+        audioTrack.enabled = !audioTrack.enabled;
+
+        if (!audioTrack.enabled) {
+          muteSelfBtn.textContent = "Unmute My Self";
+          muteSelfBtn.className = "mute-self"; // Apply muted style
+          log("Microphone muted (audio stream paused).");
+        } else {
+          muteSelfBtn.textContent = "Mute My Self";
+          muteSelfBtn.className = "unmute-self"; // Apply unmuted style
+          log("Microphone unmuted (audio stream resumed).");
+        }
+      }
+
+      function testAudio() {
+        if (!audioContext) {
+          initAudioContext().then(() => testAudio());
+          return;
+        }
+
+        const oscillator = audioContext.createOscillator();
+        const gainNode = audioContext.createGain();
+
+        oscillator.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+
+        oscillator.frequency.setValueAtTime(800, audioContext.currentTime);
+        gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
+
+        oscillator.start();
+        oscillator.stop(audioContext.currentTime + 1.0);
+
+        log("Playing test tone - if you hear it, audio playback is working.");
+      }
+
+      // Simulate periodic mark events (like Twilio does)
+      setInterval(() => {
+        if (callActive && ws && ws.readyState === WebSocket.OPEN) {
+          const markEvent = {
+            event: "mark",
+            mark: {
+              name: "keepalive_" + Date.now(),
+            },
+            streamSid: streamSid,
+          };
+
+          if (Math.random() < 0.1) {
+            ws.send(JSON.stringify(markEvent));
+          }
+        }
+      }, 1000);
+    </script>
+  </body>
+</html>
